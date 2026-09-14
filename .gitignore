@@ -1,0 +1,30 @@
+# Python / uv
+backend/.venv/
+backend/__pycache__/
+backend/**/*.pyc
+backend/.pytest_cache/
+backend/data/
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+
+# Node / Vite
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+
+# Tooling artifacts
+.mimosa/

@@ -1,0 +1,33 @@
+{
+  "repo_url": "https://github.com/hevangel/ai_team_event_organizer",
+  "built_by_ai": true,
+  "entries": [
+    {
+      "date": "2026-09-13",
+      "agent": "ZCode CLI",
+      "model": "GLM-5.3-Flash",
+      "work": "Initial implementation: FastAPI + SQLite backend, FastMCP v4 server, Vite/React frontend, admin panel, browser-verified e2e; AI-attribution footer; multi-admin management (People tab, REST + MCP); login-page MCP setup hints for Claude Code/Codex with CLI-overridable display URL; fixed Google Maps loading=async crash that blanked the site; explicit /mcp 307 redirect for POST clients; configured the real event via MCP (AMD Vancouver office + 3 restaurants + movie theatre + escape room)",
+      "tokens_in": 1650000,
+      "tokens_out": 195000,
+      "cost_usd": 5.1,
+      "estimated": true
+    },
+    {
+      "date": "2026-09-13",
+      "agent": "ZCode CLI",
+      "model": "GLM-5.3-Flash",
+      "work": "Voter page layout rework: venue map enlarged to full column width with food/activity lists below it; hovering a food/activity card spotlights its marker on the map (bounce + info card); office pin is now 🏢. Venue suggest/edit form: default map centered on the office with bigger map, place search by name auto-fills the venue name + address + pin (rebuilt AddressSearch on AutocompleteService with an in-app dropdown; fixed map staying on the default center after a search). Admin: Locations tab office address now searchable and the map shows all venues (fixed never-centering view), headcount limit accepts blank = no limit, admin panel fills the screen height; pinned Maps JS to v=quarterly and added map teardown on unmount. Re-geocoded office + all 5 venues via Google Places (stored office coords had been wrong: 49.2626,-123.0996 instead of 49.2604,-123.0422)",
+      "tokens_in": 490000,
+      "tokens_out": 58000,
+      "cost_usd": 1.6,
+      "estimated": true
+    }
+  ],
+  "totals": {
+    "tokens_in": 2140000,
+    "tokens_out": 253000,
+    "cost_usd": 6.7,
+    "estimated": true
+  },
+  "note": "Updated before every commit by the contributing agent (mandatory pre-commit rule in AGENTS.md). Token counts and costs are agent-reported estimates, not billing data."
+}

@@ -1,0 +1,13 @@
+[project]
+name = "ai-team-event-organizer-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "fastmcp>=4",
+    "httpx>=0.28.1",
+    "pyjwt[crypto]>=2.14.0",
+    "uvicorn[standard]>=0.52.4",
+]

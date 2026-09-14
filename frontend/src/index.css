@@ -1,0 +1,63 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-100 font-sans text-slate-800 antialiased;
+}
+
+/* Calendar availability cells */
+@utility slot-cell {
+  @apply relative h-11 w-full cursor-pointer rounded-lg border border-slate-200 bg-white transition-all duration-100 hover:scale-[1.04] hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60;
+}
+@utility slot-level-yes {
+  @apply border-emerald-400 bg-emerald-200/70;
+}
+@utility slot-level-weak {
+  @apply border-amber-400 bg-amber-200/70;
+}
+@utility slot-level-strong {
+  @apply border-violet-500 bg-violet-300/70;
+}
+
+@utility card {
+  @apply rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm;
+}
+
+@utility btn {
+  @apply inline-flex items-center justify-center gap-1.5 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors;
+}
+@utility btn-primary {
+  @apply btn bg-indigo-600 text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50;
+}
+@utility btn-ghost {
+  @apply btn text-slate-600 hover:bg-slate-200/70 disabled:cursor-not-allowed disabled:opacity-50;
+}
+@utility btn-outline {
+  @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50;
+}
+@utility btn-danger {
+  @apply btn border border-rose-200 bg-rose-50 text-rose-600 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+@utility input {
+  @apply w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20;
+}
+
+@utility label {
+  @apply mb-1 block text-xs font-semibold tracking-wide text-slate-500 uppercase;
+}
+
+@utility chip {
+  @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium;
+}
