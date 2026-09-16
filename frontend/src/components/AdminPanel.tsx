@@ -283,10 +283,16 @@ function ScheduleTab({
 
   function applyRanges() {
     const next = [...slots]
+    // Unsaved rows need their own ids: a shared -1 makes React reuse the wrong
+    // row identity and the per-slot remove button delete the wrong chip.
+    let tempId = Math.min(0, ...next.map((s) => s.id)) - 1
     for (const iso of selectedDates) {
       for (const r of ranges) {
         const dup = next.some((s) => s.date === iso && s.start_time === r.start && s.end_time === r.end)
-        if (!dup && r.start < r.end) next.push({ id: -1, date: iso, start_time: r.start, end_time: r.end })
+        if (!dup && r.start < r.end) {
+          next.push({ id: tempId, date: iso, start_time: r.start, end_time: r.end })
+          tempId -= 1
+        }
       }
     }
     next.sort((a, b) => (a.date + a.start_time).localeCompare(b.date + b.start_time))
@@ -294,7 +300,9 @@ function ScheduleTab({
     setSelectedDates(new Set())
   }
 
-  const pending = slots.length !== state.slots.length
+  // Compare contents, not just the count: editing a slot's date or time keeps
+  // the count identical, and a count-only check left Save disabled.
+  const pending = normalizeSlots(slots) !== normalizeSlots(state.slots)
 
   async function save() {
     setBusy(true)
@@ -404,7 +412,7 @@ function ScheduleTab({
               </div>
               <div className="flex flex-wrap gap-1.5">
                 {daySlots.map((s) => (
-                  <span key={`${s.date}-${s.start_time}`} className="chip border border-slate-200 bg-white text-slate-600">
+                  <span key={s.id} className="chip border border-slate-200 bg-white text-slate-600">
                     {s.start_time}–{s.end_time}
                     <button className="ml-0.5 text-slate-300 hover:text-rose-500" onClick={() => setSlots(slots.filter((x) => x.id !== s.id))}>
                       ×
@@ -419,11 +427,20 @@ function ScheduleTab({
           {busy ? 'Saving…' : 'Save schedule'}
         </button>
         <p className="mt-2 text-xs text-slate-400">
-          Replacing the schedule clears availability for removed slots. Voters keep their venue votes.
+          Slots you keep are left untouched, so voters keep their availability for them. Only
+          removed slots lose their availability; venue votes are unaffected.
         </p>
       </div>
     </div>
   )
+}
+
+/** Order-independent, id-independent fingerprint of a schedule. */
+function normalizeSlots(slots: TimeSlot[]): string {
+  return slots
+    .map((s) => `${s.date}T${s.start_time}-${s.end_time}`)
+    .sort()
+    .join('|')
 }
 
 function chunkWeeks(cells: (Date | null)[]): (Date | null)[][] {

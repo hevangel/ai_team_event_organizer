@@ -66,13 +66,25 @@ def okta_login():
 
 
 @router.get("/auth/okta/callback")
-def okta_callback(code: str, state: str, request: Request, response: Response):
-    received = auth._cookie_value(request.headers.get("cookie"), auth.STATE_COOKIE)
-    claims = auth.okta_exchange_code(code, state, received)
+def okta_callback(code: str, state: str, request: Request):
+    """Redeem the authorization code and hand the browser a real session.
+
+    The cookie must be attached to the response object that is actually
+    returned; mutating FastAPI's injected `response` and then returning a
+    different Response silently drops the Set-Cookie header, leaving the user
+    signed out after a successful Okta round-trip.
+    """
+    cookie_state = auth._cookie_value(request.headers.get("cookie"), auth.STATE_COOKIE)
+    # The cookie holds the value we generated; `state` is what Okta echoed back.
+    if not cookie_state:
+        raise ApiError(400, "Okta state cookie missing; please retry the sign-in")
+    claims = auth.okta_exchange_code(code, cookie_state, state)
     user_id, display_name = auth.okta_identity(claims)
     result = service.login_okta(user_id, display_name)
-    response.headers["Set-Cookie"] = auth.session_cookie(result["token"])
-    return Response(status_code=302, headers={"Location": "/"})
+    redirect = Response(status_code=302, headers={"Location": "/"})
+    redirect.headers.append("set-cookie", auth.session_cookie(result["token"]))
+    redirect.headers.append("set-cookie", auth.clear_okta_state_cookie())
+    return redirect
 
 
 @router.post("/logout")

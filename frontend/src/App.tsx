@@ -75,6 +75,33 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meId])
 
+  // An admin can delete slots or venues while a voter has an unsaved draft.
+  // Polling picks the change up, so drop the options that no longer exist —
+  // otherwise Save fails on an unknown id or submits a stale choice. Every
+  // still-valid unsaved selection is preserved.
+  const slotKey = state?.slots.map((s) => s.id).join(',') ?? ''
+  const foodKey = state?.venues.filter((v) => v.type === 'food').map((v) => v.id).join(',') ?? ''
+  const activityKey = state?.venues.filter((v) => v.type === 'activity').map((v) => v.id).join(',') ?? ''
+  useEffect(() => {
+    const ids = (key: string) => new Set(key ? key.split(',').map(Number) : [])
+    const slots = ids(slotKey)
+    const food = ids(foodKey)
+    const activity = ids(activityKey)
+    setDraft((d) => {
+      if (!d) return d
+      const availability = Object.fromEntries(
+        Object.entries(d.availability).filter(([id]) => slots.has(Number(id))),
+      ) as Record<number, Level>
+      const nextFood = d.food.filter((id) => food.has(id))
+      const nextActivity = d.activity.filter((id) => activity.has(id))
+      const unchanged =
+        Object.keys(availability).length === Object.keys(d.availability).length &&
+        nextFood.length === d.food.length &&
+        nextActivity.length === d.activity.length
+      return unchanged ? d : { ...d, availability, food: nextFood, activity: nextActivity }
+    })
+  }, [slotKey, foodKey, activityKey])
+
   // First-run: admin signs into an unconfigured event -> admin view by default.
   useEffect(() => {
     if (state?.me?.is_admin && state.slots.length === 0 && state.venues.length === 0) {

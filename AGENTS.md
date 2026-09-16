@@ -1,4 +1,4 @@
-# AI Team Event Organizer — Agent Handbook
+﻿# AI Team Event Organizer — Agent Handbook
 
 This file has two parts: **1) the product spec** (requirements, unchanged) and
 **2) implementation notes for AI agents** (you, in a future session). Read
@@ -62,9 +62,12 @@ GUI, an AI agent can do via the MCP server (or the REST API).
   [--mcp-port P] [--mcp-subpath S]` — the `--mcp-*` flags only change the
   MCP URL displayed in the login-page setup hints (`config.mcp_url_override`
   in `/api/state`; null = frontend derives it from `window.location`).
-- Backend tests: `cd backend && uv run python scripts/smoke_test.py` (43
+- Backend tests: `cd backend && uv run python scripts/smoke_test.py` (106
   checks; uses a throwaway DB via `DB_PATH` env read at import time — keep
-  env-setting **before** `from app.main import app`).
+  env-setting **before** `from app.main import app`). The last three sections
+  (`audit_checks`, `okta_checks`, `mcp_sso_identity_checks`) are the issue #1
+  regressions; they run *after* the MCP section and build their own schedule,
+  venues and voters, so don't assume earlier state there.
 - Frontend build (includes `tsc -b`): `cd frontend && npm run build`.
 - Run all: `uv run python -m app [--admin USER] [--port 8000]` +
   `npm run dev` (Vite proxies `/api` and `/mcp`) or `npm run build` and let
@@ -114,15 +117,44 @@ backend/app/
   Admins can promote/demote others (`admin_set_admin`): self-demotion and
   demoting the last admin are rejected; demotion clears the startup
   designation so the login rule can't re-promote the demoted user.
+- **MCP identity**: `mcp_identity(user_id, session_token)` trusts a bare
+  `user_id` **only in testing mode**. With SSO the call must carry the caller's
+  web session (`session` cookie or `Authorization: Bearer`) and it must belong
+  to that userid — otherwise any MCP client could impersonate an admin. The
+  header plumbing is `_session_token()` in `mcp_server.py`
+  (`fastmcp.server.dependencies.get_http_headers`); in-process clients have no
+  HTTP context, which is why only testing mode accepts them.
 - **Closed voting** = manual `voting_closed` flag OR `now >= voting_closes_at`
-  → blocks `save_vote` and `suggest_venue` (403).
+  → blocks `save_vote` and `suggest_venue` (403). Deadlines are normalized
+  through `_as_aware()`: a naive stored value is read as server-local, so an
+  offset-bearing value can't raise TypeError on comparison.
 - **Results visibility**: anonymous → counts only for *everyone including
   admin*; `hide_live_counts` → voters see nothing until close; admin
   (non-anonymous) always sees full detail. Logic in `compute_results`.
+  Anonymous `admin_get_votes` returns **no** `people` rows at all — one row per
+  voter still leaks each ballot even with the name blanked.
 - **Headcount limit**: enforced at save time, first-come-first-served —
-  once full, only users with an existing vote may update.
+  once full, only users with an existing vote may update. An empty ballot still
+  claims a place (the saved row *is* the reservation), and `save_vote` opens
+  with `BEGIN IMMEDIATE` so two simultaneous first-time saves can't both take
+  the last place.
 - **Preference mode**: `simple` maps any level to `yes` on save;
   `strong_weak` keeps `strong|weak`.
+- **Validation**: every value crossing the API boundary goes through the
+  `_require_*` helpers at the top of `service.py` (ids, finite numbers with
+  ranges, bools, text lengths, enums, id lists) → `ApiError(422)`. Don't call
+  `int()`/`float()` on request data directly; that surfaces as a 500 and can
+  write permanently invalid rows.
+- **Vote hygiene**: venue ids are de-duplicated on save *and* when aggregating,
+  so one voter counts once per venue.
+- **Schedule reconciliation**: `admin_set_slots` still takes the complete
+  schedule, but a slot is identified by `(date, start, end)` — unchanged slots
+  keep their row id so availability and venue compatibility survive. Removed
+  slots cascade their availability and are pruned from `venues.slot_ids`
+  (`_prune_venue_slots`); a venue whose constrained list empties out is
+  deactivated rather than silently becoming "fits anything".
+- **Stale selections**: `_strip_venue_from_votes` is the single cleanup path —
+  call it whenever a venue is removed, deactivated or re-typed.
 
 ### MCP (fastmcp v4) gotchas
 
@@ -144,18 +176,44 @@ backend/app/
 - Google Maps loads lazily (`loadGoogleMaps` in `components/ui.tsx`); without
   a key, `MapPanel` renders a graceful placeholder and address inputs become
   plain text. Key resolution: admin-panel setting (DB) overrides env var.
+- Places predictions come from `AutocompleteService.getPlacePredictions`
+  (**not** `getPredictions`, which doesn't exist). `AddressSearch` also reports
+  raw typed text so an address entered without picking a prediction isn't lost.
+- `MapPanel` InfoWindow content is built from DOM nodes, never an HTML string —
+  venue names/descriptions are voter-supplied. `markerKey` includes the venue
+  text so an edit refreshes the card without resetting pan/zoom.
 - Polling never clobbers the unsaved draft: `Draft.loadedFor` re-inits only
-  when the signed-in user changes.
-- Dev servers: backend 8000, Vite 5173 (proxy). Production: `npm run build`,
-  backend serves `dist` (mount skipped at import if dist absent — build
-  before start, or restart after building).
+  when the signed-in user changes. A second effect prunes slot/venue ids the
+  admin deleted, keeping the rest of the draft intact.
+- Dev servers: backend 8000 by default, Vite 5173 (proxy). The proxy target is
+  `VITE_API_TARGET` (default `http://127.0.0.1:8002` — port 8000 is taken on the
+  deployment box) and `server.allowedHosts` must list any hostname the dev page
+  is opened under, or Vite 8 answers "Blocked request". Production:
+  `npm run build`, backend serves `dist` (mount skipped at import if dist
+  absent — build before start, or restart after building).
 
 ### Testing at home (no Okta, no Maps key)
 
 Everything works: testing-mode login, admin panel (schedule picker, venue
 CRUD, settings), voting, live suggestions, live results, MCP. Okta needs a
 real tenant (`OKTA_*` env vars + redirect URI `{BASE_URL}/api/auth/okta/callback`).
-Google Maps needs a key with Maps JavaScript + Places APIs.
+Google Maps needs a key with Maps JavaScript + Places + Geocoding APIs.
+
+The backend also uses the Geocoding REST API server-side (service._geocode_address):
+when a venue is added with an address but no lat/lng, or the office address is
+saved without coordinates, it geocodes so the pin lands on the map. This is the
+path AI agents hit when adding venues over MCP with just an address. Best-effort:
+on geocode failure the record is stored without a pin. Outbound call is locked to
+https://maps.googleapis.com (allowlisted host, encoded query, no redirects).
+
+### Verified (2026-09-15) — issue #1 audit bugfixes
+
+Smoke test 106/106 (61 pre-existing + 45 new regression checks) and
+`npm run build` clean. The concurrency check was verified to be meaningful by
+temporarily disabling `BEGIN IMMEDIATE`: all 6 racers then took 2 seats.
+Not re-verified in a browser this session; the Okta path is covered only by a
+mocked tenant (fake `httpx`/`jwt` in `okta_checks`), so the real tenant still
+needs a walkthrough at work.
 
 ### Verified end-to-end (2026-09-13)
 

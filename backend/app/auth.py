@@ -27,6 +27,11 @@ def clear_session_cookie() -> str:
     return f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
 
 
+def clear_okta_state_cookie() -> str:
+    """The state/nonce cookie is single-use; drop it once the code is redeemed."""
+    return f"{STATE_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"
+
+
 def _cookie_value(cookies: str | None, name: str) -> str | None:
     if not cookies:
         return None
@@ -45,7 +50,12 @@ def token_from_request(request) -> str | None:
 # -------------------------------------------------------------------- okta
 
 def okta_login_url() -> tuple[str, str]:
-    """Build the Okta authorize URL; returns (url, state)."""
+    """Build the Okta authorize URL; returns (url, state).
+
+    The nonce is the same high-entropy value as the state so that the single
+    state cookie binds both: the callback can verify that the id_token it got
+    back was minted for *this* login request (see okta_exchange_code).
+    """
     if not CONFIG.okta_enabled:
         raise ApiError(404, "Okta SSO is not configured")
     state = secrets.token_urlsafe(24)
@@ -55,7 +65,7 @@ def okta_login_url() -> tuple[str, str]:
         "scope": "openid profile email",
         "redirect_uri": CONFIG.okta_redirect_uri,
         "state": state,
-        "nonce": secrets.token_urlsafe(16),
+        "nonce": state,
     }
     url = f"{CONFIG.okta_issuer}/v1/authorize?{urlencode(params)}"
     return url, state
@@ -102,6 +112,14 @@ def okta_exchange_code(code: str, expected_state: str, received_state: str | Non
             )
         except jwt.PyJWTError as exc:
             raise ApiError(502, f"Okta id_token verification failed: {exc}")
+
+    # Bind the token to this login request: the nonce we sent to Okta (the
+    # state value) must come back in the id_token. Without this, a validly
+    # signed token minted for a different login flow would pass every other
+    # check.
+    nonce = claims.get("nonce")
+    if not isinstance(nonce, str) or not secrets.compare_digest(nonce, expected_state):
+        raise ApiError(400, "Okta id_token nonce mismatch; please retry the sign-in")
     return claims
 
 
