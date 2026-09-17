@@ -1,10 +1,14 @@
 """Business logic shared by the REST API and the MCP server."""
 
 import json
+import math
 import secrets
 import sqlite3
 from datetime import datetime
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import CONFIG
 from .db import (
@@ -20,6 +24,139 @@ from .footer import load_footer
 
 VENUE_TYPES = ("food", "activity")
 AVAILABILITY_LEVELS = ("yes", "weak", "strong")
+PREFERENCE_MODES = ("simple", "strong_weak")
+BUDGET_TYPES = ("per_head", "total")
+
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+# Sanity bounds. Money is a REAL column, so anything astronomically large is a
+# typo or an attack rather than a real per-head budget.
+MAX_MONEY = 1_000_000_000.0
+
+
+# ---------------------------------------------------------------- validation
+#
+# Everything that crosses the API boundary (REST body, MCP tool argument)
+# passes through here. Without it, `int("x")` / `float(None)` surface as a 500
+# and out-of-range values reach SQLite as permanently invalid state.
+
+def _require_id(value: Any, what: str) -> int:
+    """A row id: a positive integer. Accepts the JSON-ish forms clients send
+    (int, or a digit string) and rejects floats, bools and junk."""
+    if isinstance(value, bool):
+        raise ApiError(422, f"{what} must be a positive integer, got {value!r}")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().lstrip("+").isdigit():
+        number = int(value.strip())
+    else:
+        raise ApiError(422, f"{what} must be a positive integer, got {value!r}")
+    if number <= 0:
+        raise ApiError(422, f"{what} must be a positive integer, got {number}")
+    return number
+
+
+def _require_number(value: Any, what: str, low: float, high: float) -> float:
+    """A finite float inside [low, high]. NaN/inf are rejected: they would
+    poison every later comparison and aggregate."""
+    if isinstance(value, bool):
+        raise ApiError(422, f"{what} must be a number, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ApiError(422, f"{what} must be a number, got {value!r}") from None
+    if not math.isfinite(number):
+        raise ApiError(422, f"{what} must be a finite number, got {value!r}")
+    if not low <= number <= high:
+        raise ApiError(422, f"{what} must be between {low} and {high}, got {number}")
+    return number
+
+
+def _require_bool(value: Any, what: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false", "1", "0"):
+        return value.strip().lower() in ("true", "1")
+    raise ApiError(422, f"{what} must be true or false, got {value!r}")
+
+
+def _require_text(value: Any, what: str, max_length: int = 2000) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ApiError(422, f"{what} must be text, got {value!r}")
+    text = str(value)
+    if len(text) > max_length:
+        raise ApiError(422, f"{what} must be at most {max_length} characters")
+    return text
+
+
+def _require_choice(value: Any, what: str, choices: tuple[str, ...]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise ApiError(422, f"{what} must be one of {list(choices)}, got {value!r}")
+    return value
+
+
+def _require_id_list(value: Any, what: str) -> list[int]:
+    """De-duplicated, order-preserving list of row ids."""
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ApiError(422, f"{what} must be a list of positive integers, got {value!r}")
+    out: list[int] = []
+    for item in value:
+        number = _require_id(item, f"{what} entry")
+        if number not in out:
+            out.append(number)
+    return out
+
+
+class _RefuseRedirects(HTTPRedirectHandler):
+    """The geocoder talks only to the allowlisted host; never follow redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+# ----------------------------------------------------------------- geocoding
+
+def _maps_api_key(settings: dict[str, Any]) -> str:
+    """Same resolution the frontend gets in /api/state: admin-set key wins."""
+    return str(settings.get("google_maps_api_key") or "").strip() or CONFIG.maps_api_key
+
+
+def _geocode_address(address: str, api_key: str) -> tuple[float, float] | None:
+    """Server-side geocode for locations added without coordinates — the
+    typical case when an AI agent creates a venue over MCP with just an
+    address string. Best-effort: any failure returns None and the caller
+    stores the venue without a pin rather than erroring.
+
+    Outbound boundary: the request goes to the hardcoded Google Maps host
+    over https only. The user-supplied address is confined to the
+    fully percent-encoded query string, redirects are refused, and the
+    parsed URL is re-checked against the allowlist before sending.
+    """
+    if not address.strip() or not api_key:
+        return None
+    url = GEOCODE_URL + "?address=" + quote(address, safe="") + "&key=" + quote(api_key, safe="")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "maps.googleapis.com":
+        return None
+    try:
+        opener = build_opener(_RefuseRedirects)
+        request = Request(url, headers={"User-Agent": "ai-team-event-organizer"})
+        with opener.open(request, timeout=5) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != "OK" or not data.get("results"):
+            return None
+        location = data["results"][0]["geometry"]["location"]
+        return float(location["lat"]), float(location["lng"])
+    except (HTTPError, URLError, TimeoutError, ValueError, KeyError):
+        return None
 
 
 # ------------------------------------------------------------------- users
@@ -81,12 +218,39 @@ def require_admin(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row:
     return row
 
 
-def mcp_identity(user_id: str) -> str:
-    """An MCP call acts for a human, so it counts as a login: create the user
-    if needed and apply the first-login-admin rule (same as testing login)."""
+def mcp_identity(user_id: str, session_token: str | None = None) -> str:
+    """Resolve (and authenticate) the human an MCP call is acting for.
+
+    Testing mode keeps the honesty policy of the userid login: the
+    caller-supplied user_id is trusted, the user row is created if needed and
+    the first-login-admin rule applies.
+
+    With SSO (testing mode off) a bare userid would let any MCP client
+    impersonate a voter or an admin, so the call must carry the caller's web
+    session — either the `session` cookie or the same token as an
+    `Authorization: Bearer` header — and that session must belong to the
+    submitted userid.
+    """
     user_id = (user_id or "").strip()
     if not user_id:
         raise ApiError(400, "user_id is required")
+
+    if not CONFIG.testing_mode:
+        token = (session_token or "").strip()
+        if not token:
+            raise ApiError(
+                401,
+                "MCP calls require your web session: sign in to the webapp and send the "
+                "session token as an Authorization: Bearer header (or the session cookie)",
+            )
+        with db() as conn:
+            row = user_for_token(conn, token)
+            if row is None:
+                raise ApiError(401, "Session expired or unknown; sign in to the webapp again")
+            if row["user_id"] != user_id:
+                raise ApiError(403, f"Session does not belong to {user_id}")
+        return user_id
+
     with db() as conn:
         _ensure_user(conn, user_id)
         promote_admin_on_login(conn, user_id)
@@ -153,17 +317,30 @@ def _user_dict(row: sqlite3.Row, is_admin: bool | int) -> dict[str, Any]:
 
 # ----------------------------------------------------------------- voting
 
+def _as_aware(value: datetime) -> datetime:
+    """Interpret a naive timestamp in the server's timezone.
+
+    Deadlines are usually stored as naive local strings (`2026-09-20T18:00`
+    from a datetime-local input) but a client may send one with an offset.
+    Comparing the two kinds raises TypeError, so both sides are normalized to
+    aware instants while keeping the server-local reading of legacy values.
+    """
+    if value.tzinfo is None:
+        return value.astimezone()
+    return value
+
+
 def voting_is_closed(settings: dict[str, Any], at: datetime | None = None) -> bool:
     if settings.get("voting_closed"):
         return True
     closes_at = settings.get("voting_closes_at")
     if not closes_at:
         return False
-    at = at or datetime.now()
     try:
-        return at >= datetime.fromisoformat(str(closes_at))
-    except ValueError:
+        deadline = datetime.fromisoformat(str(closes_at))
+    except (TypeError, ValueError):
         return False
+    return _as_aware(at or datetime.now()) >= _as_aware(deadline)
 
 
 def close_reason(settings: dict[str, Any]) -> str | None:
@@ -197,15 +374,19 @@ def save_vote(
     activity_venue_ids: list[int] | None,
 ) -> dict[str, Any]:
     """Replace the caller's current vote. This is the 'save button'."""
+    availability = availability or []
+    if isinstance(availability, (str, bytes)) or not isinstance(availability, (list, tuple)):
+        raise ApiError(422, "availability must be a list of {slot_id, level} objects")
+    # De-duplicated up front: the same venue id twice must not store two
+    # selections nor count the voter twice in the results.
+    food_venue_ids = _require_id_list(food_venue_ids, "food_venue_ids")
+    activity_venue_ids = _require_id_list(activity_venue_ids, "activity_venue_ids")
+
     with db() as conn:
         user = get_user_or_404(conn, user_id)
         settings = get_settings(conn)
         if voting_is_closed(settings):
             raise ApiError(403, "Voting is closed; your selection can no longer be changed")
-
-        availability = availability or []
-        food_venue_ids = [int(v) for v in (food_venue_ids or [])]
-        activity_venue_ids = [int(v) for v in (activity_venue_ids or [])]
 
         # Validate availability levels against the preference mode. In simple
         # mode anything maps to plain "yes".
@@ -213,13 +394,13 @@ def save_vote(
         clean_availability: list[tuple[int, str]] = []
         seen_slots: set[int] = set()
         for item in availability:
-            slot_id = int(item["slot_id"])
+            if not isinstance(item, dict):
+                raise ApiError(422, f"availability entry must be an object, got {item!r}")
+            slot_id = _require_id(item.get("slot_id"), "slot_id")
             if slot_id in seen_slots:
                 continue
             seen_slots.add(slot_id)
-            level = str(item.get("level", "yes"))
-            if level not in AVAILABILITY_LEVELS:
-                raise ApiError(422, f"Invalid availability level: {level}")
+            level = _require_choice(item.get("level", "yes"), "availability level", AVAILABILITY_LEVELS)
             if simple:
                 level = "yes"
             clean_availability.append((slot_id, level))
@@ -248,17 +429,20 @@ def save_vote(
                 raise ApiError(422, f"Unknown or inactive {venue_type} venue ids: {sorted(missing)}")
 
         # Headcount limit is first-come-first-served: once full, only people
-        # who already have a saved vote may update theirs.
+        # who already have a saved vote may update theirs. Claiming a place
+        # counts even with an empty ballot — a saved row *is* the reservation,
+        # so exempting empty ballots would let anyone slip past a full event.
+        #
+        # BEGIN IMMEDIATE takes SQLite's write lock before the count is read,
+        # so two simultaneous first-time saves cannot both see the last free
+        # place and overbook.
         limit = settings.get("headcount_limit")
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
             "SELECT 1 FROM votes WHERE user_id = ?", (user["user_id"],)
         ).fetchone()
-        if (
-            limit
-            and existing is None
-            and (food_venue_ids or activity_venue_ids or clean_availability)
-            and headcount_taken(conn) >= int(limit)
-        ):
+        if limit and existing is None and headcount_taken(conn) >= int(limit):
             raise ApiError(403, f"Headcount limit reached ({limit}); the event is full")
 
         conn.execute("DELETE FROM availability WHERE user_id = ?", (user["user_id"],))
@@ -297,36 +481,61 @@ def suggest_venue(user_id: str, fields: dict[str, Any]) -> int:
 def _validate_venue_fields(fields: dict[str, Any], partial: bool) -> dict[str, Any]:
     clean: dict[str, Any] = {}
     if not partial or "name" in fields:
-        name = str(fields.get("name") or "").strip()
+        name = _require_text(fields.get("name"), "Venue name", 200).strip()
         if not name:
             raise ApiError(422, "Venue name is required")
         clean["name"] = name
     if not partial or "type" in fields:
-        vtype = str(fields.get("type") or "").strip()
+        vtype = _require_text(fields.get("type"), "Venue type", 20).strip()
         if vtype not in VENUE_TYPES:
             raise ApiError(422, "Venue type must be 'food' or 'activity'")
         clean["type"] = vtype
-    for key in ("description", "address"):
-        if not partial or key in fields:
-            clean[key] = str(fields.get(key) or "")
+    if not partial or "description" in fields:
+        clean["description"] = _require_text(fields.get("description"), "Venue description", 2000)
+    if not partial or "address" in fields:
+        clean["address"] = _require_text(fields.get("address"), "Venue address", 500)
     if not partial or "estimated_cost" in fields:
         cost = fields.get("estimated_cost")
-        clean["estimated_cost"] = None if cost in (None, "") else float(cost)
-    for key in ("lat", "lng"):
+        clean["estimated_cost"] = (
+            None
+            if cost in (None, "")
+            else _require_number(cost, "estimated_cost", 0, MAX_MONEY)
+        )
+    for key, bound in (("lat", 90.0), ("lng", 180.0)):
         if not partial or key in fields:
             value = fields.get(key)
-            clean[key] = None if value in (None, "") else float(value)
+            clean[key] = None if value in (None, "") else _require_number(value, key, -bound, bound)
     if not partial or "slot_ids" in fields:
-        clean["slot_ids"] = [int(s) for s in (fields.get("slot_ids") or [])]
+        clean["slot_ids"] = _require_id_list(fields.get("slot_ids"), "slot_ids")
     if not partial or "active" in fields:
-        clean["active"] = 1 if fields.get("active") in (True, 1, "1") else 0
+        clean["active"] = 1 if _require_bool(fields.get("active", False), "active") else 0
     return clean
+
+
+def _check_slot_ids_exist(conn: sqlite3.Connection, slot_ids: list[int]) -> None:
+    """A venue's compatibility list must reference real time slots, otherwise
+    the venue silently never matches anything."""
+    if not slot_ids:
+        return
+    placeholders = ",".join("?" * len(slot_ids))
+    known = {
+        row["id"]
+        for row in conn.execute(f"SELECT id FROM time_slots WHERE id IN ({placeholders})", slot_ids)
+    }
+    missing = [s for s in slot_ids if s not in known]
+    if missing:
+        raise ApiError(422, f"Unknown time slot ids in slot_ids: {missing}")
 
 
 def _insert_venue(
     conn: sqlite3.Connection, fields: dict[str, Any], suggested_by: str | None
 ) -> int:
     clean = _validate_venue_fields(fields, partial=False)
+    _check_slot_ids_exist(conn, clean.get("slot_ids", []))
+    if clean.get("lat") is None or clean.get("lng") is None:
+        coords = _geocode_address(clean.get("address", ""), _maps_api_key(get_settings(conn)))
+        if coords:
+            clean["lat"], clean["lng"] = coords
     cursor = conn.execute(
         "INSERT INTO venues (name, type, description, estimated_cost, address, lat, lng, "
         "suggested_by, slot_ids, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
@@ -402,8 +611,14 @@ def compute_results(
             for r in conn.execute("SELECT user_id, display_name FROM users")
         }
         for row in rows:
+            # One voter counts once per venue even if a legacy row (or a
+            # client bug) stored the same id twice.
+            seen: set[str] = set()
             for venue_id in json.loads(row["ids"]):
                 key = str(venue_id)
+                if key in seen:
+                    continue
+                seen.add(key)
                 counts[key] = counts.get(key, 0) + 1
                 if include_names:
                     voters_by_venue.setdefault(key, []).append(names.get(row["user_id"], row["user_id"]))
@@ -507,51 +722,171 @@ def get_state(user_id: str | None = None) -> dict[str, Any]:
 
 # ---------------------------------------------------------- admin actions
 
+def _validate_settings_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    """Coerce and range-check an admin settings patch.
+
+    Settings are stored as JSON blobs, so an untyped value written here stays
+    wrong forever (a string budget breaks every later comparison, a NaN
+    coordinate breaks the map). Every recognized key gets a type here.
+    """
+    if not isinstance(patch, dict):
+        raise ApiError(422, "settings patch must be an object")
+    unknown = set(patch) - set(ADMIN_SETTING_KEYS)
+    if unknown:
+        raise ApiError(422, f"Unknown setting keys: {sorted(unknown)}")
+
+    clean: dict[str, Any] = {}
+    for key, value in patch.items():
+        if key in ("event_title", "event_description", "office_address", "google_maps_api_key"):
+            clean[key] = _require_text(value, key, 4000)
+        elif key in ("allow_venue_suggestions", "anonymous_voting", "hide_live_counts",
+                     "show_footer_to_voters", "voting_closed"):
+            clean[key] = _require_bool(value, key)
+        elif key == "preference_mode":
+            clean[key] = _require_choice(value, key, PREFERENCE_MODES)
+        elif key == "budget_type":
+            clean[key] = _require_choice(value, key, BUDGET_TYPES)
+        elif key == "budget_amount":
+            clean[key] = None if value in (None, "") else _require_number(value, key, 0, MAX_MONEY)
+        elif key == "headcount_limit":
+            clean[key] = None if value in (None, "") else _require_id(value, key)
+        elif key == "office_lat":
+            clean[key] = None if value in (None, "") else _require_number(value, key, -90, 90)
+        elif key == "office_lng":
+            clean[key] = None if value in (None, "") else _require_number(value, key, -180, 180)
+        elif key == "voting_closes_at":
+            if value in (None, ""):
+                clean[key] = None
+            else:
+                try:
+                    datetime.fromisoformat(str(value))
+                except (TypeError, ValueError):
+                    raise ApiError(
+                        422, "voting_closes_at must be an ISO datetime like 2026-09-20T18:00"
+                    ) from None
+                clean[key] = str(value)
+        else:  # pragma: no cover - ADMIN_SETTING_KEYS and this map are in sync
+            clean[key] = value
+    return clean
+
+
 def admin_update_settings(user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
     with db() as conn:
         require_admin(conn, user_id)
         settings = get_settings(conn)
-        unknown = set(patch) - set(ADMIN_SETTING_KEYS)
-        if unknown:
-            raise ApiError(422, f"Unknown setting keys: {sorted(unknown)}")
-        if "preference_mode" in patch and patch["preference_mode"] not in ("simple", "strong_weak"):
-            raise ApiError(422, "preference_mode must be 'simple' or 'strong_weak'")
-        if "budget_type" in patch and patch["budget_type"] not in ("per_head", "total"):
-            raise ApiError(422, "budget_type must be 'per_head' or 'total'")
-        if "voting_closes_at" in patch and patch["voting_closes_at"]:
-            try:
-                datetime.fromisoformat(str(patch["voting_closes_at"]))
-            except ValueError:
-                raise ApiError(422, "voting_closes_at must be an ISO datetime like 2026-09-20T18:00")
+        patch = _validate_settings_patch(patch)
+        # Office set by address alone (e.g. an agent over MCP): geocode it so
+        # the voters' map centers correctly without extra round-trips.
+        if "office_address" in patch and "office_lat" not in patch and "office_lng" not in patch:
+            coords = _geocode_address(str(patch["office_address"] or ""), _maps_api_key(settings))
+            if coords:
+                patch = {**patch, "office_lat": coords[0], "office_lng": coords[1]}
         for key, value in patch.items():
             set_setting(conn, key, value)
         return public_settings(get_settings(conn))
 
 
 def admin_set_slots(user_id: str, slots: list[dict[str, Any]]) -> dict[str, Any]:
-    """Full replacement of the candidate time slots (admin date/time setup)."""
-    clean = []
+    """Reconcile the candidate time slots with the list the admin submitted.
+
+    The payload is still the complete schedule, but a slot is *identified* by
+    its (date, start, end): unchanged slots keep their row id. Recreating every
+    row would orphan the availability and venue-compatibility that reference
+    those ids, so re-saving an untouched schedule used to wipe everyone's
+    availability.
+    """
+    if isinstance(slots, (str, bytes)) or not isinstance(slots, (list, tuple)):
+        raise ApiError(422, "slots must be a list of {date, start_time, end_time} objects")
+    clean: list[tuple[str, str, str]] = []
     for item in slots:
-        date = str(item.get("date") or "").strip()
-        start = str(item.get("start_time") or "").strip()
-        end = str(item.get("end_time") or "").strip()
+        if not isinstance(item, dict):
+            raise ApiError(422, f"Invalid slot: {item!r} (expected an object)")
+        date = _require_text(item.get("date"), "slot date", 10).strip()
+        start = _require_text(item.get("start_time"), "slot start_time", 5).strip()
+        end = _require_text(item.get("end_time"), "slot end_time", 5).strip()
         try:
             datetime.strptime(date, "%Y-%m-%d")
             datetime.strptime(start, "%H:%M")
             datetime.strptime(end, "%H:%M")
         except ValueError:
-            raise ApiError(422, f"Invalid slot: {item!r} (need date YYYY-MM-DD, times HH:MM)")
+            raise ApiError(422, f"Invalid slot: {item!r} (need date YYYY-MM-DD, times HH:MM)") from None
         if end <= start:
             raise ApiError(422, f"Slot end must be after start: {start}-{end}")
-        clean.append((date, start, end))
+        entry = (date, start, end)
+        if entry not in clean:  # the same slot listed twice is one slot
+            clean.append(entry)
     clean.sort()
+
     with db() as conn:
         require_admin(conn, user_id)
-        conn.execute("DELETE FROM time_slots")
+        existing = {
+            (row["date"], row["start_time"], row["end_time"]): row["id"]
+            for row in conn.execute("SELECT id, date, start_time, end_time FROM time_slots")
+        }
+        wanted = set(clean)
+        removed_ids = [slot_id for key, slot_id in existing.items() if key not in wanted]
+        if removed_ids:
+            placeholders = ",".join("?" * len(removed_ids))
+            # availability rows cascade with the slot (FK ON DELETE CASCADE).
+            conn.execute(f"DELETE FROM time_slots WHERE id IN ({placeholders})", removed_ids)
         conn.executemany(
-            "INSERT INTO time_slots (date, start_time, end_time) VALUES (?, ?, ?)", clean
+            "INSERT INTO time_slots (date, start_time, end_time) VALUES (?, ?, ?)",
+            [entry for entry in clean if entry not in existing],
         )
+        if removed_ids:
+            _prune_venue_slots(conn, set(removed_ids))
         return {"slot_count": len(clean)}
+
+
+def _prune_venue_slots(conn: sqlite3.Connection, removed_ids: set[int]) -> None:
+    """Drop deleted slots from every venue's compatibility list.
+
+    A venue that listed specific slots and lost all of them is no longer
+    compatible with anything on the schedule. Leaving an empty list behind
+    would silently flip it to "fits any slot", so it is deactivated and pulled
+    out of saved votes instead.
+    """
+    for row in conn.execute("SELECT id, slot_ids, active FROM venues").fetchall():
+        try:
+            slot_ids = [int(s) for s in json.loads(row["slot_ids"])]
+        except (TypeError, ValueError):
+            slot_ids = []
+        if not slot_ids:
+            continue
+        kept = [s for s in slot_ids if s not in removed_ids]
+        if kept == slot_ids:
+            continue
+        if kept:
+            conn.execute("UPDATE venues SET slot_ids = ? WHERE id = ?", (json.dumps(kept), row["id"]))
+            continue
+        conn.execute(
+            "UPDATE venues SET slot_ids = ?, active = 0 WHERE id = ?", (json.dumps([]), row["id"])
+        )
+        if row["active"]:
+            _strip_venue_from_votes(conn, int(row["id"]))
+
+
+def _strip_venue_from_votes(
+    conn: sqlite3.Connection, venue_id: int, columns: tuple[str, ...] = ("food_venue_ids", "activity_venue_ids")
+) -> None:
+    """Remove a venue id from every saved ballot.
+
+    Saved votes are JSON arrays, so a venue that is deleted, deactivated or
+    re-categorized has to be pulled out explicitly — otherwise the stale id
+    keeps affecting results and no longer matches the venue the voter sees.
+    """
+    for column in columns:
+        for vote in conn.execute(f"SELECT user_id, {column} AS ids FROM votes").fetchall():
+            try:
+                ids = [int(v) for v in json.loads(vote["ids"])]
+            except (TypeError, ValueError):
+                continue
+            kept = [v for v in ids if v != venue_id]
+            if kept != ids:
+                conn.execute(
+                    f"UPDATE votes SET {column} = ?, updated_at = ? WHERE user_id = ?",
+                    (json.dumps(kept), now_iso(), vote["user_id"]),
+                )
 
 
 def admin_add_venue(user_id: str, fields: dict[str, Any]) -> int:
@@ -561,12 +896,17 @@ def admin_add_venue(user_id: str, fields: dict[str, Any]) -> int:
 
 
 def admin_update_venue(user_id: str, venue_id: int, patch: dict[str, Any]) -> None:
+    venue_id = _require_id(venue_id, "venue_id")
+    if not isinstance(patch, dict):
+        raise ApiError(422, "venue patch must be an object")
     with db() as conn:
         require_admin(conn, user_id)
         row = conn.execute("SELECT * FROM venues WHERE id = ?", (venue_id,)).fetchone()
         if row is None:
             raise ApiError(404, f"Venue {venue_id} not found")
         clean = _validate_venue_fields(dict(row) | {"slot_ids": json.loads(row["slot_ids"])} | patch, partial=True)
+        if "slot_ids" in clean:
+            _check_slot_ids_exist(conn, clean["slot_ids"])
         updates, values = [], []
         for key, value in clean.items():
             updates.append(f"{key} = ?")
@@ -575,25 +915,26 @@ def admin_update_venue(user_id: str, venue_id: int, patch: dict[str, Any]) -> No
             values.append(venue_id)
             conn.execute(f"UPDATE venues SET {', '.join(updates)} WHERE id = ?", values)
 
+        # Saved ballots reference this venue by id, so an edit that changes
+        # *what* the venue is must not leave stale selections behind:
+        #  - deactivating hides it from the UI but the id would keep counting;
+        #  - flipping food <-> activity would leave the id in the wrong list,
+        #    where it no longer matches the category the voter picked.
+        deactivated = "active" in clean and not clean["active"] and row["active"]
+        retyped = "type" in clean and clean["type"] != row["type"]
+        if deactivated or retyped:
+            _strip_venue_from_votes(conn, venue_id)
+
 
 def admin_remove_venue(user_id: str, venue_id: int) -> None:
+    venue_id = _require_id(venue_id, "venue_id")
     with db() as conn:
         require_admin(conn, user_id)
         row = conn.execute("SELECT * FROM venues WHERE id = ?", (venue_id,)).fetchone()
         if row is None:
             raise ApiError(404, f"Venue {venue_id} not found")
         conn.execute("UPDATE venues SET active = 0 WHERE id = ?", (venue_id,))
-        # Drop it from everyone's saved votes.
-        for column in ("food_venue_ids", "activity_venue_ids"):
-            for vote in conn.execute(
-                f"SELECT user_id, {column} AS ids FROM votes WHERE {column} LIKE ?",
-                (f"%{venue_id}%",),
-            ).fetchall():
-                ids = [v for v in json.loads(vote["ids"]) if v != venue_id]
-                conn.execute(
-                    f"UPDATE votes SET {column} = ? WHERE user_id = ?",
-                    (json.dumps(ids), vote["user_id"]),
-                )
+        _strip_venue_from_votes(conn, venue_id)
 
 
 def admin_list_users(user_id: str) -> list[dict[str, Any]]:
@@ -669,32 +1010,31 @@ def admin_get_votes(user_id: str) -> dict[str, Any]:
                 "SELECT id, date, start_time, end_time FROM time_slots ORDER BY date, start_time"
             )
         ]
+        # Anonymity means aggregate-only, for admins too. Returning one row per
+        # voter — even with the name blanked — still leaks each individual
+        # ballot (and re-identifies people through their pick combination), so
+        # no rows are emitted at all; the UI shows the aggregate view instead.
         people: list[dict[str, Any]] = []
-        for u in conn.execute("SELECT * FROM users ORDER BY created_at"):
-            availability = {
-                str(r["slot_id"]): r["level"]
-                for r in conn.execute(
-                    "SELECT slot_id, level FROM availability WHERE user_id = ?", (u["user_id"],)
-                )
-            }
-            vote = _load_vote(conn, u["user_id"])
-            person = {
-                "has_vote": vote["has_vote"],
-                "food_venue_ids": vote["food_venue_ids"],
-                "activity_venue_ids": vote["activity_venue_ids"],
-            }
-            if not anonymous:
-                person["user_id"] = u["user_id"]
-                person["display_name"] = u["display_name"] or u["user_id"]
-                person["availability"] = availability
-            else:
-                # Anonymity: identity and per-person detail stay hidden.
-                person["user_id"] = None
-                person["display_name"] = "(anonymous)"
-                person["availability"] = {}
-            if u["user_id"] == admin["user_id"] and not anonymous:
-                person["is_me"] = True
-            people.append(person)
+        if not anonymous:
+            for u in conn.execute("SELECT * FROM users ORDER BY created_at"):
+                availability = {
+                    str(r["slot_id"]): r["level"]
+                    for r in conn.execute(
+                        "SELECT slot_id, level FROM availability WHERE user_id = ?", (u["user_id"],)
+                    )
+                }
+                vote = _load_vote(conn, u["user_id"])
+                person: dict[str, Any] = {
+                    "has_vote": vote["has_vote"],
+                    "food_venue_ids": vote["food_venue_ids"],
+                    "activity_venue_ids": vote["activity_venue_ids"],
+                    "user_id": u["user_id"],
+                    "display_name": u["display_name"] or u["user_id"],
+                    "availability": availability,
+                }
+                if u["user_id"] == admin["user_id"]:
+                    person["is_me"] = True
+                people.append(person)
         return {
             "anonymous": anonymous,
             "closed": closed,

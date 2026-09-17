@@ -70,9 +70,25 @@ export default function McpSetup({ config }: { config: AppConfig }) {
         <code className="rounded bg-slate-100 px-1 py-0.5 font-mono">
           [mcp_servers.team-event] url = "{url}"
         </code>
-        . Every tool takes a <code>user_id</code> — your agent votes as you, same trust rules as
-        the userid login above.
+        . Every tool takes a <code>user_id</code> — your agent votes as you.
       </p>
+      {config.testing_mode ? (
+        <p className="mt-2 text-[11px] leading-relaxed text-slate-400">
+          Testing mode: the <code>user_id</code> is taken at face value, same trust rules as the
+          userid login above.
+        </p>
+      ) : (
+        <p className="mt-2 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-700">
+          🔐 SSO is on, so a userid alone isn't enough: sign in here first, then give your agent
+          your session token as a bearer header — e.g.{' '}
+          <code className="rounded bg-amber-100/70 px-1 py-0.5 font-mono">
+            claude mcp add --transport http --header "Authorization: Bearer $TEAM_EVENT_TOKEN"
+            team-event {url}
+          </code>
+          . The server rejects calls whose session doesn't match the submitted{' '}
+          <code>user_id</code>.
+        </p>
+      )}
     </div>
   )
 }

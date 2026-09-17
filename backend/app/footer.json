@@ -21,12 +21,32 @@
       "tokens_out": 58000,
       "cost_usd": 1.6,
       "estimated": true
+    },
+    {
+      "date": "2026-09-14",
+      "agent": "ZCode CLI",
+      "model": "GLM-5.3-Flash",
+      "work": "Server-side geocoding via the Google Geocoding REST API (user enabled it for the key): venues added with an address but no lat/lng — the typical MCP agent path — and office addresses saved without coordinates are now geocoded automatically so pins land on the map. Best-effort with an explicit outbound boundary (https allowlist, encoded query, no redirects); verified live end-to-end",
+      "tokens_in": 90000,
+      "tokens_out": 14000,
+      "cost_usd": 0.3,
+      "estimated": true
+    },
+    {
+      "date": "2026-09-15",
+      "agent": "Kiro",
+      "model": "Claude Opus 5",
+      "work": "Fixed the 15 audit findings from GitHub issue #1: Places autocomplete called a nonexistent method (getPredictions -> getPlacePredictions) and dropped addresses typed without picking a prediction; map InfoWindows built venue text into HTML (now DOM nodes, so a suggested venue can't inject script); Okta callback mutated the wrong Response and lost the session cookie; Okta id_token nonce was never verified (now bound to the login state); MCP trusted a bare userid in SSO mode (now requires a matching web session via cookie or bearer token); malformed ids/costs/coordinates/settings reached business logic (shared _require_* validators -> 422); duplicate venue ids inflated counts; empty ballots bypassed the headcount limit and concurrent saves could overbook (BEGIN IMMEDIATE); replacing a schedule recreated every slot id and orphaned availability plus venue compatibility; venue deactivation/re-categorization left stale saved selections; anonymous admin results still returned per-voter ballots; offset-aware deadlines raised TypeError; React drafts kept admin-deleted options; schedule dirty-state missed same-count edits; Vite blocked the deployment hostname and hardcoded the proxy port. Backend smoke test grown 61 -> 106 checks (incl. a threaded headcount race and a mocked-Okta cookie/nonce test); frontend build clean",
+      "tokens_in": 415000,
+      "tokens_out": 47000,
+      "cost_usd": 1.9,
+      "estimated": true
     }
   ],
   "totals": {
-    "tokens_in": 2140000,
-    "tokens_out": 253000,
-    "cost_usd": 6.7,
+    "tokens_in": 2645000,
+    "tokens_out": 314000,
+    "cost_usd": 8.9,
     "estimated": true
   },
   "note": "Updated before every commit by the contributing agent (mandatory pre-commit rule in AGENTS.md). Token counts and costs are agent-reported estimates, not billing data."

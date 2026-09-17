@@ -8,6 +8,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi.testclient import TestClient  # noqa: E402
 from fastmcp.exceptions import ToolError  # noqa: E402
 
+from app.errors import ApiError  # noqa: E402
 from app.main import app  # noqa: E402
 from app.mcp_server import mcp  # noqa: E402
 
@@ -296,8 +298,366 @@ def main() -> None:
         # ---- MCP tools
         asyncio.run(mcp_checks())
 
+        # ---- regressions for the audit findings in github issue #1
+        audit_checks(bob)
+        okta_checks()
+        mcp_sso_identity_checks()
+
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)
+
+
+def audit_checks(admin: TestClient) -> None:
+    """Regression checks for github issue #1 (correctness / data-integrity).
+
+    Runs after the MCP section, so it sets up its own schedule, venues and
+    voters instead of relying on earlier state. `admin` is an admin client.
+    """
+    admin.put(
+        "/api/admin/settings",
+        json={
+            "patch": {
+                "voting_closed": False,
+                "voting_closes_at": None,
+                "headcount_limit": None,
+                "anonymous_voting": False,
+                "preference_mode": "strong_weak",
+            }
+        },
+    )
+
+    # --- #9 duplicate schedule entries collapse into one slot
+    schedule = [
+        {"date": "2026-10-05", "start_time": "11:00", "end_time": "14:00"},
+        {"date": "2026-10-06", "start_time": "11:00", "end_time": "14:00"},
+        {"date": "2026-10-06", "start_time": "11:00", "end_time": "14:00"},  # duplicate
+    ]
+    r = admin.put("/api/admin/slots", json={"slots": schedule})
+    check("duplicate schedule entries collapsed", r.status_code == 200 and r.json()["slot_count"] == 2)
+    slots = admin.get("/api/state").json()["slots"]
+    slot_a, slot_b = slots[0]["id"], slots[1]["id"]
+
+    r = admin.post(
+        "/api/admin/venues", json={"name": "Audit Diner", "type": "food", "slot_ids": [slot_a]}
+    )
+    food_id = r.json()["venue_id"]
+    r = admin.post("/api/admin/venues", json={"name": "Audit Arcade", "type": "activity"})
+    activity_id = r.json()["venue_id"]
+
+    dave = TestClient(app)
+    dave.post("/api/login", json={"userid": "dave"})
+
+    # --- #7 duplicate ids are stored once and counted once
+    r = dave.put(
+        "/api/vote",
+        json={
+            "availability": [
+                {"slot_id": slot_a, "level": "strong"},
+                {"slot_id": slot_a, "level": "weak"},
+            ],
+            "food_venue_ids": [food_id, food_id],
+            "activity_venue_ids": [activity_id, activity_id, activity_id],
+        },
+    )
+    check("duplicate ids accepted", r.status_code == 200 and r.json()["slots"] == 1)
+    st = dave.get("/api/state").json()
+    check(
+        "duplicate venue ids de-duplicated in storage",
+        st["my_vote"]["food_venue_ids"] == [food_id]
+        and st["my_vote"]["activity_venue_ids"] == [activity_id],
+    )
+    check(
+        "duplicate venue ids counted once",
+        st["results"]["food"][str(food_id)]["count"] == 1,
+        f"got {st['results']['food'].get(str(food_id))}",
+    )
+
+    # --- #9 re-saving the same schedule keeps ids and availability
+    r = admin.put(
+        "/api/admin/slots",
+        json={
+            "slots": [
+                {"date": s["date"], "start_time": s["start_time"], "end_time": s["end_time"]}
+                for s in slots
+            ]
+        },
+    )
+    check("re-saving an unchanged schedule keeps the count", r.json()["slot_count"] == 2)
+    st = dave.get("/api/state").json()
+    check("slot ids preserved across a schedule save", [s["id"] for s in st["slots"]] == [slot_a, slot_b])
+    check(
+        "availability survives an unchanged schedule save",
+        st["my_availability"] == {str(slot_a): "strong"},
+        f"got {st['my_availability']}",
+    )
+
+    # --- #9/#10 a venue that loses its whole compatibility list is disabled
+    r = admin.put(
+        "/api/admin/slots",
+        json={"slots": [{"date": "2026-10-06", "start_time": "11:00", "end_time": "14:00"}]},
+    )
+    check("schedule shrinks to 1 slot", r.status_code == 200 and r.json()["slot_count"] == 1)
+    st = dave.get("/api/state").json()
+    check(
+        "venue left without a compatible slot deactivated",
+        all(v["id"] != food_id for v in st["venues"]),
+    )
+    check("that venue stripped from saved votes", st["my_vote"]["food_venue_ids"] == [])
+    check("availability for a removed slot dropped", st["my_availability"] == {})
+
+    # --- #10 changing a venue's category strips stale selections
+    r = admin.put(f"/api/admin/venues/{activity_id}", json={"type": "food"})
+    check("venue re-categorized", r.status_code == 200)
+    st = dave.get("/api/state").json()
+    check("re-categorized venue stripped from votes", st["my_vote"]["activity_venue_ids"] == [])
+
+    # --- #10 deactivating a venue strips it too
+    r = dave.put("/api/vote", json={"food_venue_ids": [activity_id], "activity_venue_ids": []})
+    check("dave votes for the re-categorized venue", r.status_code == 200)
+    r = admin.put(f"/api/admin/venues/{activity_id}", json={"active": False})
+    check("venue deactivated", r.status_code == 200)
+    st = dave.get("/api/state").json()
+    check("deactivated venue stripped from votes", st["my_vote"]["food_venue_ids"] == [])
+
+    # --- #8 an empty ballot cannot slip past a full headcount
+    taken = admin.get("/api/state").json()["results"]["headcount_taken"]
+    admin.put("/api/admin/settings", json={"patch": {"headcount_limit": taken}})
+    erin = TestClient(app)
+    erin.post("/api/login", json={"userid": "erin"})
+    r = erin.put("/api/vote", json={"availability": [], "food_venue_ids": [], "activity_venue_ids": []})
+    check("empty ballot cannot bypass a full headcount", r.status_code == 403, f"got {r.status_code}")
+    r = dave.put("/api/vote", json={"availability": [], "food_venue_ids": [], "activity_venue_ids": []})
+    check("existing voter can still update when full", r.status_code == 200)
+    admin.put("/api/admin/settings", json={"patch": {"headcount_limit": None}})
+
+    # --- #8 simultaneous first-time saves must not overbook the last places
+    seats = 2
+    taken = admin.get("/api/state").json()["results"]["headcount_taken"]
+    admin.put("/api/admin/settings", json={"patch": {"headcount_limit": taken + seats}})
+    racers = []
+    for i in range(6):
+        racer = TestClient(app)
+        racer.post("/api/login", json={"userid": f"racer{i}"})
+        racers.append(racer)
+    gate = threading.Barrier(len(racers))
+    statuses: list[int] = []
+    lock = threading.Lock()
+
+    def race(racer: TestClient) -> None:
+        empty = {"availability": [], "food_venue_ids": [], "activity_venue_ids": []}
+        gate.wait()
+        status = racer.put("/api/vote", json=empty).status_code
+        with lock:
+            statuses.append(status)
+
+    threads = [threading.Thread(target=race, args=(racer,)) for racer in racers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(
+        "concurrent saves fill exactly the free places",
+        statuses.count(200) == seats,
+        f"got {sorted(statuses)}",
+    )
+    check(
+        "headcount never exceeds the limit under concurrency",
+        admin.get("/api/state").json()["results"]["headcount_taken"] == taken + seats,
+    )
+    admin.put("/api/admin/settings", json={"patch": {"headcount_limit": None}})
+
+    # --- #6 invalid values are 422s, not 500s or corrupt rows
+    for label, body in (
+        ("a negative cost", {"name": "Bad", "type": "food", "estimated_cost": -5}),
+        ("an out-of-range latitude", {"name": "Bad", "type": "food", "lat": 120, "lng": 0}),
+        ("an unknown compatible slot", {"name": "Bad", "type": "food", "slot_ids": [9999]}),
+    ):
+        r = admin.post("/api/admin/venues", json=body)
+        check(f"venue with {label} rejected", r.status_code == 422, f"got {r.status_code}")
+
+    for label, patch in (
+        ("a negative headcount", {"headcount_limit": -5}),
+        ("a non-numeric budget", {"budget_amount": "lots"}),
+        ("a non-boolean anonymity flag", {"anonymous_voting": "maybe"}),
+        ("an unparseable close time", {"voting_closes_at": "next tuesday"}),
+        ("an out-of-range office latitude", {"office_lat": 200}),
+    ):
+        r = admin.put("/api/admin/settings", json={"patch": patch})
+        check(f"setting with {label} rejected", r.status_code == 422, f"got {r.status_code}")
+
+    r = dave.put("/api/vote", json={"availability": [{"slot_id": "abc", "level": "yes"}]})
+    check("malformed slot id rejected", r.status_code == 422, f"got {r.status_code}")
+
+    # --- #12 an offset-aware deadline is comparable, not a TypeError
+    r = admin.put(
+        "/api/admin/settings", json={"patch": {"voting_closes_at": "2020-01-01T00:00:00+00:00"}}
+    )
+    check("offset-aware deadline accepted", r.status_code == 200, f"got {r.status_code}")
+    st = admin.get("/api/state").json()
+    check(
+        "offset-aware deadline closes voting",
+        st["status"]["closed"] is True and st["status"]["reason"] == "time",
+    )
+    admin.put("/api/admin/settings", json={"patch": {"voting_closes_at": None}})
+
+    # --- #11 anonymous admin results are aggregate-only
+    admin.put("/api/admin/settings", json={"patch": {"anonymous_voting": True}})
+    votes = admin.get("/api/admin/votes").json()
+    check("anonymous admin view returns no ballot rows", votes["people"] == [])
+    check("anonymous admin view keeps the aggregate", votes["results"]["visible"] is True)
+    admin.put("/api/admin/settings", json={"patch": {"anonymous_voting": False}})
+
+
+def okta_checks() -> None:
+    """#3/#4: the callback must set the session cookie, and the id_token nonce
+    must be bound to the login request. Okta itself is faked — no tenant needed.
+    """
+    from app import auth
+    from app.config import CONFIG
+
+    class _FakeTokenResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {"id_token": "fake.id.token"}
+
+    class _FakeHttpxClient:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a) -> bool:
+            return False
+
+        def post(self, *a, **k):
+            return _FakeTokenResponse()
+
+    class _FakeSigningKey:
+        key = "fake-key"
+
+    class _FakeJWKClient:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        def get_signing_key_from_jwt(self, token):  # noqa: ARG002
+            return _FakeSigningKey()
+
+    claims: dict = {}
+
+    class _FakeJwt:
+        PyJWTError = Exception
+        PyJWKClient = _FakeJWKClient
+
+        @staticmethod
+        def decode(*a, **k):
+            return dict(claims)
+
+    originals = (
+        auth.httpx,
+        auth.jwt,
+        CONFIG.okta_domain,
+        CONFIG.okta_client_id,
+        CONFIG.okta_client_secret,
+    )
+    auth.httpx = type("httpx", (), {"Client": _FakeHttpxClient})
+    auth.jwt = _FakeJwt
+    CONFIG.okta_domain = "https://okta.example.com/oauth2/default"
+    CONFIG.okta_client_id = "client-id"
+    CONFIG.okta_client_secret = "client-secret"
+    try:
+        url, state = auth.okta_login_url()
+        check("okta authorize request binds nonce to state", f"nonce={state}" in url)
+
+        claims.clear()
+        claims.update({"nonce": "some-other-login", "email": "attacker@example.com"})
+        try:
+            auth.okta_exchange_code("code", state, state)
+            check("okta id_token with a foreign nonce rejected", False)
+        except ApiError as exc:
+            check(
+                "okta id_token with a foreign nonce rejected",
+                exc.status == 400 and "nonce" in exc.message,
+                exc.message,
+            )
+
+        claims.clear()
+        claims.update({"nonce": state, "email": "okta.user@example.com", "name": "Okta User"})
+        verified = auth.okta_exchange_code("code", state, state)
+        check("okta id_token with the matching nonce accepted", verified["email"] == "okta.user@example.com")
+
+        # The redirect that reaches the browser must carry the session cookie.
+        browser = TestClient(app)
+        browser.cookies.set(auth.STATE_COOKIE, state)
+        r = browser.get(
+            f"/api/auth/okta/callback?code=code&state={state}", follow_redirects=False
+        )
+        cookies = r.headers.get_list("set-cookie")
+        check("okta callback redirects to the app", r.status_code == 302)
+        check(
+            "okta callback sets the session cookie on the redirect",
+            any(c.startswith(f"{auth.SESSION_COOKIE}=") and "Max-Age=0" not in c for c in cookies),
+            f"got {cookies}",
+        )
+        check(
+            "okta callback clears the single-use state cookie",
+            any(c.startswith(f"{auth.STATE_COOKIE}=") and "Max-Age=0" in c for c in cookies),
+            f"got {cookies}",
+        )
+        check(
+            "okta session works for the app",
+            browser.get("/api/state").json()["me"]["user_id"] == "okta.user@example.com",
+        )
+    finally:
+        (
+            auth.httpx,
+            auth.jwt,
+            CONFIG.okta_domain,
+            CONFIG.okta_client_id,
+            CONFIG.okta_client_secret,
+        ) = originals
+
+
+def mcp_sso_identity_checks() -> None:
+    """#5: with SSO on, an MCP caller must prove the userid with a session."""
+    from app import service as svc
+    from app.config import CONFIG
+    from app.db import db
+
+    CONFIG.testing_mode = False
+    try:
+        try:
+            svc.mcp_identity("dave", None)
+            check("mcp userid without a session rejected in SSO mode", False)
+        except ApiError as exc:
+            check("mcp userid without a session rejected in SSO mode", exc.status == 401, exc.message)
+
+        try:
+            svc.mcp_identity("dave", "not-a-real-token")
+            check("mcp unknown session rejected", False)
+        except ApiError as exc:
+            check("mcp unknown session rejected", exc.status == 401, exc.message)
+
+        with db() as conn:
+            token = svc.create_session(conn, "dave")
+        try:
+            svc.mcp_identity("erin", token)
+            check("mcp session/userid mismatch rejected", False)
+        except ApiError as exc:
+            check("mcp session/userid mismatch rejected", exc.status == 403, exc.message)
+
+        check("mcp matching session accepted", svc.mcp_identity("dave", token) == "dave")
+
+        # An unknown userid must not be auto-created in SSO mode.
+        try:
+            svc.mcp_identity("ghost", token)
+            check("mcp cannot invent a user in SSO mode", False)
+        except ApiError as exc:
+            check("mcp cannot invent a user in SSO mode", exc.status == 403, exc.message)
+    finally:
+        CONFIG.testing_mode = True
 
 
 async def mcp_checks() -> None:

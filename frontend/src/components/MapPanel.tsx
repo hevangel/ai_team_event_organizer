@@ -24,15 +24,28 @@ function markerIcon(color: string) {
   }
 }
 
-function infoHtml(v: Venue): string {
-  return [
-    `<b>${v.name}</b>`,
-    v.type === 'food' ? '🍽 Food' : '🎯 Activity',
-    v.estimated_cost != null ? `~$${v.estimated_cost}` : null,
-    v.description,
-  ]
-    .filter(Boolean)
-    .join('<br/>')
+/**
+ * InfoWindow content built from DOM nodes, never an HTML string: venue names
+ * and descriptions are user-supplied (voters can suggest venues), so markup
+ * in them must never be parsed as HTML.
+ */
+function infoContent(v: Venue): HTMLElement {
+  const root = document.createElement('div')
+  root.className = 'text-sm leading-snug'
+
+  const title = document.createElement('b')
+  title.textContent = v.name
+  root.append(title)
+
+  const lines: string[] = [v.type === 'food' ? '🍽 Food' : '🎯 Activity']
+  if (v.estimated_cost != null) lines.push(`~$${v.estimated_cost}`)
+  if (v.description) lines.push(v.description)
+
+  for (const line of lines) {
+    root.append(document.createElement('br'))
+    root.append(document.createTextNode(line))
+  }
+  return root
 }
 
 /**
@@ -71,12 +84,17 @@ export default function MapPanel({
   const [ready, setReady] = useState(false)
   const [failed, setFailed] = useState<string | null>(null)
 
-  // Rebuild markers only when the set of pins actually changes, so periodic
-  // state polling never resets the user's pan/zoom.
+  // Rebuild markers only when the pins or the text they show actually change,
+  // so periodic state polling never resets the user's pan/zoom — but an edited
+  // venue name/description/cost does refresh its info card.
   const markerKey = useMemo(
     () =>
       (center ? `office@${center.lat.toFixed(6)},${center.lng.toFixed(6)}|` : '') +
-      venues.map((v) => `${v.id}@${v.lat ?? ''},${v.lng ?? ''}`).join('|'),
+      venues
+        .map((v) =>
+          [v.id, v.lat ?? '', v.lng ?? '', v.type, v.name, v.estimated_cost ?? '', v.description].join('~'),
+        )
+        .join('|'),
     [center, venues],
   )
 
@@ -160,7 +178,7 @@ export default function MapPanel({
           label: { text: venueGlyph(v), fontSize: '12px' },
         })
         m.addListener('click', () => {
-          new window.google.maps.InfoWindow({ content: infoHtml(v) }).open({ anchor: m, map: mapRef.current })
+          new window.google.maps.InfoWindow({ content: infoContent(v) }).open({ anchor: m, map: mapRef.current })
         })
         byIdRef.current.set(v.id, m)
         markersRef.current.push(m)
@@ -197,7 +215,7 @@ export default function MapPanel({
       const venue = venues.find((v) => v.id === highlightId)
       if (!marker || !venue) return
       marker.setAnimation(window.google.maps.Animation.BOUNCE)
-      const info = new window.google.maps.InfoWindow({ content: infoHtml(venue) })
+      const info = new window.google.maps.InfoWindow({ content: infoContent(venue) })
       info.open({ anchor: marker, map: mapRef.current })
       mapRef.current.panTo(marker.getPosition())
       highlightRef.current = { marker, info }

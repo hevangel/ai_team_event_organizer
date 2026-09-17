@@ -63,8 +63,10 @@ export function AddressSearch({
     }
   }, [apiKey])
 
-  // No-Maps fallback: report the typed text verbatim as the address (no
-  // coordinates are available without Places).
+  // Report the typed text verbatim as the address. This covers both the
+  // no-Maps fallback and the case where the user types an address but never
+  // picks a prediction — the typed value must not be silently dropped (a
+  // later pick() overwrites this with the geocoded selection).
   useEffect(() => {
     if (plainAddress === null) return
     const selection: PlaceSelection = { address: plainAddress, name: '', lat: null, lng: null }
@@ -81,6 +83,11 @@ export function AddressSearch({
     return sessionTokenRef.current
   }
 
+  /** A Places session ends with the getDetails call it paid for. */
+  function endSession() {
+    sessionTokenRef.current = null
+  }
+
   function fetchPredictions(searchText: string) {
     window.clearTimeout(debounceRef.current)
     if (!mapsReady || !searchText.trim() || !window.google?.maps?.places) {
@@ -91,7 +98,9 @@ export function AddressSearch({
     debounceRef.current = window.setTimeout(() => {
       try {
         const service = new window.google.maps.places.AutocompleteService()
-        service.getPredictions(
+        // Places JS exposes getPlacePredictions on AutocompleteService
+        // (getPredictions does not exist and throws).
+        service.getPlacePredictions(
           { input: searchText, sessionToken: nextSessionToken() },
           (preds: any[] | null, status: string) => {
             if (status === 'OK' && preds && preds.length > 0) {
@@ -122,16 +131,21 @@ export function AddressSearch({
   }
 
   function pick(item: Prediction) {
+    // A queued prediction fetch would re-open the dropdown right after the
+    // user committed to a choice — drop it.
+    window.clearTimeout(debounceRef.current)
     setOpen(false)
     setItems([])
+    const token = sessionTokenRef.current
     try {
       // item.placeId is Google's own id from the prediction list above (never
       // raw user text). Details are fetched through a detached PlacesService,
       // so no visible map is required here.
       const placesService = new window.google.maps.places.PlacesService(document.createElement('div'))
       placesService.getDetails(
-        { placeId: item.placeId, fields: PLACE_DETAIL_FIELDS, sessionToken: sessionTokenRef.current },
+        { placeId: item.placeId, fields: PLACE_DETAIL_FIELDS, sessionToken: token },
         (place: any, status: string) => {
+          endSession()
           if (status === 'OK' && place?.geometry) {
             const selection: PlaceSelection = {
               address: place.formatted_address || item.desc,
@@ -140,17 +154,21 @@ export function AddressSearch({
               lng: place.geometry.location.lng(),
             }
             setTyped(selection.address)
+            setPlainAddress(null)
             onChange(selection)
           } else {
             const fallback: PlaceSelection = { address: item.desc, name: item.main, lat: null, lng: null }
             setTyped(fallback.address)
+            setPlainAddress(null)
             onChange(fallback)
           }
         },
       )
     } catch {
+      endSession()
       const fallback: PlaceSelection = { address: item.desc, name: item.main, lat: null, lng: null }
       setTyped(fallback.address)
+      setPlainAddress(null)
       onChange(fallback)
     }
   }
@@ -183,8 +201,11 @@ export function AddressSearch({
         defaultValue={value}
         placeholder={placeholder || (mapsReady ? 'Search a place by name or address…' : 'Type an address')}
         onChange={(e) => {
+          // Always report the raw text so an address typed without picking a
+          // prediction still reaches the caller; pick() replaces it with the
+          // geocoded selection when the user chooses one.
+          setPlainAddress(e.target.value)
           if (mapsReady) fetchPredictions(e.target.value)
-          else setPlainAddress(e.target.value)
         }}
         onKeyDown={onKeyDown}
         onBlur={() => window.setTimeout(() => setOpen(false), 150)}

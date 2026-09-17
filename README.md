@@ -101,7 +101,29 @@ startup:
 uv run python -m app --mcp-hostname events.example.com --mcp-port 443 --mcp-subpath team
 ```
 
-Tools (the caller passes a `user_id`; MCP calls count as trusted logins):
+### Agent identity
+
+Every tool takes a `user_id` — the agent acts as that person. How that claim is
+authenticated depends on the login mode:
+
+- **Testing mode** (`TESTING_MODE=true`, the default): the `user_id` is trusted
+  at face value, exactly like typing your userid on the login page. An MCP call
+  counts as a login, so it also creates the user and applies the
+  first-login-becomes-admin rule.
+- **SSO mode** (`TESTING_MODE=false`): a userid alone is not accepted, otherwise
+  any MCP client could impersonate a voter or an admin. Sign in to the webapp
+  first, then send that session with the call — either the `session` cookie or
+  the same token as `Authorization: Bearer <token>`. The server verifies the
+  session belongs to the submitted `user_id` and rejects missing, expired or
+  mismatched sessions.
+
+  ```bash
+  claude mcp add --transport http \
+    --header "Authorization: Bearer $TEAM_EVENT_TOKEN" \
+    team-event https://events.example.com/mcp
+  ```
+
+Tools:
 
 | Tool                  | Purpose                                                          |
 | --------------------- | ---------------------------------------------------------------- |
@@ -126,10 +148,14 @@ Mon/Wed slots ending before 15:00 and save those ids.
 cd backend && uv run python scripts/smoke_test.py
 ```
 
-61 checks covering login/admin promotion, settings, slots, venue CRUD,
+106 checks covering login/admin promotion, settings, slots, venue CRUD,
 voting, privacy modes, closing, admin management (promote/demote and its
 guardrails), the attribution footer, the MCP display-URL override, and every
-MCP tool.
+MCP tool — plus the audit regressions: input validation (422s), vote
+de-duplication, headcount enforcement under concurrency, slot-id preservation
+across schedule edits, stale-vote cleanup, anonymous aggregate-only results,
+offset-aware deadlines, the Okta cookie/nonce handling (mocked tenant) and MCP
+session authentication in SSO mode.
 
 ## Project layout
 
